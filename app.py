@@ -37,6 +37,8 @@ BASE_DIR = Path(__file__).resolve().parent
 PRIVACY_POLICY_FILE = BASE_DIR / "legal" / "privacy_policy.txt"
 USER_AGREEMENT_FILE = BASE_DIR / "legal" / "user_agreement.txt"
 TELEGRAM_TEXT_LIMIT = 4000
+PRIVACY_POLICY_URL = "https://telegra.ph/Politika-konfidencialnosti-08-18-100"
+USER_AGREEMENT_URL = "https://telegra.ph/polzovatelskoe-soglashenie-08-18-42"
 
 
 def load_static_text(path: Path, fallback_text: str) -> str:
@@ -96,22 +98,21 @@ SUPPORT_TEXT = (
 )
 
 WELCOME_TEXT = (
+    "PLAT\n\n"
     "Всем приветик\n\n"
     "Это бот для покупки доступа в приватный канал (18+).\n\n"
     "Выбирай удобный тариф, оплачивай и после подтверждения оплаты бот выдаст ссылку на канал."
 )
 
-PRIVACY_POLICY_TEXT = load_static_text(
-    PRIVACY_POLICY_FILE,
-    "Текст политики конфиденциальности временно недоступен. Попробуйте позже.",
+PRIVACY_POLICY_TEXT = (
+    "Политика конфиденциальности:\n"
+    f"{PRIVACY_POLICY_URL}"
 )
-PRIVACY_POLICY_PAGES = split_text_for_telegram(PRIVACY_POLICY_TEXT)
 
-USER_AGREEMENT_TEXT = load_static_text(
-    USER_AGREEMENT_FILE,
-    "Текст пользовательского соглашения временно недоступен. Попробуйте позже.",
+USER_AGREEMENT_TEXT = (
+    "Пользовательское соглашение:\n"
+    f"{USER_AGREEMENT_URL}"
 )
-USER_AGREEMENT_PAGES = split_text_for_telegram(USER_AGREEMENT_TEXT)
 
 TARIFFS = {
     "tariff_week": {
@@ -197,26 +198,6 @@ def back_to_main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("◀ Назад", callback_data="main_menu")]]
     )
-
-
-def document_keyboard(prefix: str, page_index: int, total_pages: int) -> InlineKeyboardMarkup:
-    keyboard = []
-    navigation_row = []
-
-    if page_index > 0:
-        navigation_row.append(
-            InlineKeyboardButton("◀ Предыдущая", callback_data=f"{prefix}:{page_index - 1}")
-        )
-    if page_index < total_pages - 1:
-        navigation_row.append(
-            InlineKeyboardButton("Следующая ▶", callback_data=f"{prefix}:{page_index + 1}")
-        )
-
-    if navigation_row:
-        keyboard.append(navigation_row)
-
-    keyboard.append([InlineKeyboardButton("◀ Назад", callback_data="main_menu")])
-    return InlineKeyboardMarkup(keyboard)
 
 
 def invoice_keyboard(pay_url: str, invoice_id: str) -> InlineKeyboardMarkup:
@@ -343,20 +324,20 @@ async def show_support(query) -> None:
     await query.edit_message_text(SUPPORT_TEXT, reply_markup=back_to_main_menu_keyboard())
 
 
-async def show_document_page(query, pages: list[str], prefix: str, page_index: int) -> None:
-    safe_page_index = max(0, min(page_index, len(pages) - 1))
+async def show_privacy_policy(query) -> None:
     await query.edit_message_text(
-        pages[safe_page_index],
-        reply_markup=document_keyboard(prefix, safe_page_index, len(pages)),
+        PRIVACY_POLICY_TEXT,
+        reply_markup=back_to_main_menu_keyboard(),
+        disable_web_page_preview=True,
     )
 
 
-async def show_privacy_policy(query, page_index: int = 0) -> None:
-    await show_document_page(query, PRIVACY_POLICY_PAGES, "privacy_policy", page_index)
-
-
-async def show_user_agreement(query, page_index: int = 0) -> None:
-    await show_document_page(query, USER_AGREEMENT_PAGES, "user_agreement", page_index)
+async def show_user_agreement(query) -> None:
+    await query.edit_message_text(
+        USER_AGREEMENT_TEXT,
+        reply_markup=back_to_main_menu_keyboard(),
+        disable_web_page_preview=True,
+    )
 
 
 async def handle_tariff_selection(query, tariff_key: str) -> None:
@@ -467,12 +448,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await show_tariffs(query)
         elif data == "privacy_policy":
             await show_privacy_policy(query)
-        elif data.startswith("privacy_policy:"):
-            await show_privacy_policy(query, int(data.split(":", maxsplit=1)[1]))
         elif data == "user_agreement":
             await show_user_agreement(query)
-        elif data.startswith("user_agreement:"):
-            await show_user_agreement(query, int(data.split(":", maxsplit=1)[1]))
         elif data == "support":
             await show_support(query)
         elif data in TARIFFS:
