@@ -1,0 +1,5 @@
+python-telegram-bot[webhooks]
+python-dotenv
+httpx
+starlette
+uvicorn
