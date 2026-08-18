@@ -33,6 +33,61 @@ SELF_PING_ENABLED = os.getenv("SELF_PING_ENABLED", "true").lower() in {
 SELF_PING_INTERVAL_SECONDS = int(os.getenv("SELF_PING_INTERVAL_SECONDS", "840"))
 SUPPORT_USERNAME = "@volot543"
 PAYMENTS_FILE = Path("payments.json")
+BASE_DIR = Path(__file__).resolve().parent
+PRIVACY_POLICY_FILE = BASE_DIR / "legal" / "privacy_policy.txt"
+USER_AGREEMENT_FILE = BASE_DIR / "legal" / "user_agreement.txt"
+TELEGRAM_TEXT_LIMIT = 4000
+
+
+def load_static_text(path: Path, fallback_text: str) -> str:
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        logging.exception("Не удалось прочитать файл %s", path)
+        return fallback_text
+
+
+def split_text_for_telegram(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[str]:
+    pages: list[str] = []
+    current_parts: list[str] = []
+    current_length = 0
+
+    for paragraph in text.splitlines():
+        paragraph = paragraph.rstrip()
+
+        if not paragraph:
+            candidate = "\n"
+            if current_length + len(candidate) > limit and current_parts:
+                pages.append("".join(current_parts).strip())
+                current_parts = []
+                current_length = 0
+            current_parts.append(candidate)
+            current_length += len(candidate)
+            continue
+
+        candidate = f"{paragraph}\n"
+        if len(candidate) > limit:
+            if current_parts:
+                pages.append("".join(current_parts).strip())
+                current_parts = []
+                current_length = 0
+
+            for start in range(0, len(paragraph), limit):
+                pages.append(paragraph[start : start + limit].strip())
+            continue
+
+        if current_length + len(candidate) > limit and current_parts:
+            pages.append("".join(current_parts).strip())
+            current_parts = []
+            current_length = 0
+
+        current_parts.append(candidate)
+        current_length += len(candidate)
+
+    if current_parts:
+        pages.append("".join(current_parts).strip())
+
+    return pages or [text[:limit]]
 
 SUPPORT_TEXT = (
     "Если у вас возникли проблемы, можете написать сюда:\n"
@@ -45,6 +100,18 @@ WELCOME_TEXT = (
     "Это бот для покупки доступа в приватный канал (18+).\n\n"
     "Выбирай удобный тариф, оплачивай и после подтверждения оплаты бот выдаст ссылку на канал."
 )
+
+PRIVACY_POLICY_TEXT = load_static_text(
+    PRIVACY_POLICY_FILE,
+    "Текст политики конфиденциальности временно недоступен. Попробуйте позже.",
+)
+PRIVACY_POLICY_PAGES = split_text_for_telegram(PRIVACY_POLICY_TEXT)
+
+USER_AGREEMENT_TEXT = load_static_text(
+    USER_AGREEMENT_FILE,
+    "Текст пользовательского соглашения временно недоступен. Попробуйте позже.",
+)
+USER_AGREEMENT_PAGES = split_text_for_telegram(USER_AGREEMENT_TEXT)
 
 TARIFFS = {
     "tariff_week": {
@@ -109,6 +176,8 @@ def upsert_payment(invoice_id: str, **changes: object) -> dict:
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     keyboard = [
         [InlineKeyboardButton("Купить доступ", callback_data="buy")],
+        [InlineKeyboardButton("Политика конфиденциальности", callback_data="privacy_policy")],
+        [InlineKeyboardButton("Пользовательское соглашение", callback_data="user_agreement")],
         [InlineKeyboardButton("Поддержка", callback_data="support")],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -128,6 +197,26 @@ def back_to_main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("◀ Назад", callback_data="main_menu")]]
     )
+
+
+def document_keyboard(prefix: str, page_index: int, total_pages: int) -> InlineKeyboardMarkup:
+    keyboard = []
+    navigation_row = []
+
+    if page_index > 0:
+        navigation_row.append(
+            InlineKeyboardButton("◀ Предыдущая", callback_data=f"{prefix}:{page_index - 1}")
+        )
+    if page_index < total_pages - 1:
+        navigation_row.append(
+            InlineKeyboardButton("Следующая ▶", callback_data=f"{prefix}:{page_index + 1}")
+        )
+
+    if navigation_row:
+        keyboard.append(navigation_row)
+
+    keyboard.append([InlineKeyboardButton("◀ Назад", callback_data="main_menu")])
+    return InlineKeyboardMarkup(keyboard)
 
 
 def invoice_keyboard(pay_url: str, invoice_id: str) -> InlineKeyboardMarkup:
@@ -254,6 +343,22 @@ async def show_support(query) -> None:
     await query.edit_message_text(SUPPORT_TEXT, reply_markup=back_to_main_menu_keyboard())
 
 
+async def show_document_page(query, pages: list[str], prefix: str, page_index: int) -> None:
+    safe_page_index = max(0, min(page_index, len(pages) - 1))
+    await query.edit_message_text(
+        pages[safe_page_index],
+        reply_markup=document_keyboard(prefix, safe_page_index, len(pages)),
+    )
+
+
+async def show_privacy_policy(query, page_index: int = 0) -> None:
+    await show_document_page(query, PRIVACY_POLICY_PAGES, "privacy_policy", page_index)
+
+
+async def show_user_agreement(query, page_index: int = 0) -> None:
+    await show_document_page(query, USER_AGREEMENT_PAGES, "user_agreement", page_index)
+
+
 async def handle_tariff_selection(query, tariff_key: str) -> None:
     tariff = TARIFFS[tariff_key]
 
@@ -360,6 +465,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await show_main_menu(query)
         elif data == "buy":
             await show_tariffs(query)
+        elif data == "privacy_policy":
+            await show_privacy_policy(query)
+        elif data.startswith("privacy_policy:"):
+            await show_privacy_policy(query, int(data.split(":", maxsplit=1)[1]))
+        elif data == "user_agreement":
+            await show_user_agreement(query)
+        elif data.startswith("user_agreement:"):
+            await show_user_agreement(query, int(data.split(":", maxsplit=1)[1]))
         elif data == "support":
             await show_support(query)
         elif data in TARIFFS:
