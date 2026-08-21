@@ -114,31 +114,45 @@ DOCUMENTS_TEXT = (
 )
 
 TARIFFS = {
+    "tariff_day": {
+        "label": "1 день",
+        "amount_rub": "350",
+        "description": "Подписка с автопродлением каждый день",
+        "success_title": "Подписка на 1 день активирована.",
+        "interval_days": 1,
+        "recurring": True,
+    },
     "tariff_week": {
         "label": "1 неделя",
         "amount_rub": "700",
-        "description": "Попробовать и оценить",
-        "success_title": "Оплата тарифа на 1 неделю подтверждена.",
+        "description": "Подписка с автопродлением раз в 7 дней",
+        "success_title": "Подписка на 1 неделю активирована.",
+        "interval_days": 7,
+        "recurring": True,
     },
     "tariff_month": {
         "label": "Месяц",
         "amount_rub": "1200",
-        "description": "Самый оптимальный вариант",
-        "success_title": "Оплата тарифа на месяц подтверждена.",
+        "description": "Подписка с автопродлением раз в 30 дней",
+        "success_title": "Подписка на месяц активирована.",
+        "interval_days": 30,
+        "recurring": True,
     },
     "tariff_forever": {
         "label": "Навсегда",
         "amount_rub": "2700",
-        "description": "Один раз оплатил - доступ навсегда",
+        "description": "Разовый доступ без автопродления",
         "success_title": "Оплата тарифа навсегда подтверждена.",
+        "recurring": False,
     },
 }
 
 TARIFFS_TEXT = (
     "Выбери удобную подписку:\n\n"
-    "1 неделя - 700 RUB (попробовать и оценить)\n\n"
-    "Месяц - 1200 RUB (самый оптимальный вариант)\n\n"
-    "Навсегда - 2700 RUB (один раз оплатил - доступ навсегда)"
+    "1 день - 350 RUB (автопродление каждый день)\n\n"
+    "1 неделя - 700 RUB (автопродление раз в 7 дней)\n\n"
+    "Месяц - 1200 RUB (автопродление раз в 30 дней)\n\n"
+    "Навсегда - 2700 RUB (разовый доступ без автопродления)"
 )
 
 
@@ -184,6 +198,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
 
 def tariff_menu_keyboard() -> InlineKeyboardMarkup:
     keyboard = [
+        [InlineKeyboardButton("1 день", callback_data="tariff_day")],
         [InlineKeyboardButton("1 неделя", callback_data="tariff_week")],
         [InlineKeyboardButton("Месяц", callback_data="tariff_month")],
         [InlineKeyboardButton("Навсегда", callback_data="tariff_forever")],
@@ -240,7 +255,7 @@ def build_invoice_text(tariff: dict, invoice_id: str) -> str:
 def build_paid_text(tariff: dict) -> str:
     base_text = (
         f"{tariff['success_title']}\n\n"
-        "Доступ выдан. Ссылка на канал:\n"
+        "Подписка активна. Ссылка на канал:\n"
     )
 
     if PAID_CHANNEL_LINK:
@@ -288,6 +303,99 @@ def get_failed_url() -> str:
     return os.getenv("PLATEGA_FAILED_URL") or get_return_url()
 
 
+def build_platega_payload(tariff: dict, user_id: int, user_name: str, tariff_key: str) -> dict:
+    payment_details: dict[str, object] = {
+        "amount": float(tariff["amount_rub"]),
+        "currency": "RUB",
+    }
+    payload: dict[str, object] = {
+        "paymentDetails": payment_details,
+        "description": f"Доступ в канал: {tariff['label']}",
+        "return": get_return_url(),
+        "failedUrl": get_failed_url(),
+        "payload": json.dumps({"user_id": user_id, "tariff_key": tariff_key}, ensure_ascii=False),
+        "metadata": {"userId": str(user_id), "userName": user_name},
+    }
+
+    if tariff.get("recurring"):
+        payload["paymentMethod"] = 6
+        payment_details["interval"] = tariff["interval_days"]
+
+    return payload
+
+
+def parse_callback_json(callback: dict) -> dict:
+    payload = callback.get("payload") or callback.get("Payload") or ""
+    if not isinstance(payload, str) or not payload.strip():
+        return {}
+
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError:
+        return {}
+
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def find_payment_by_payload(callback_payload: dict) -> tuple[str | None, dict | None]:
+    user_id = callback_payload.get("user_id")
+    tariff_key = callback_payload.get("tariff_key")
+    if user_id is None or tariff_key is None:
+        return None, None
+
+    user_id = int(user_id)
+    payments = load_payments()
+    for payment_id, payment in payments.items():
+        if payment.get("user_id") == user_id and payment.get("tariff_key") == tariff_key:
+            return payment_id, payment
+
+    return None, None
+
+
+def get_callback_value(callback: dict, *keys: str) -> object:
+    for key in keys:
+        if key in callback:
+            return callback[key]
+    return None
+
+
+def normalize_callback_status(status: object) -> str:
+    if not isinstance(status, str):
+        return ""
+    return status.strip().upper()
+
+
+def resolve_callback_payment(callback: dict) -> tuple[str | None, dict | None]:
+    callback_id = get_callback_value(callback, "id", "Id")
+    if isinstance(callback_id, str) and callback_id:
+        payment = get_payment(callback_id)
+        if payment:
+            return callback_id, payment
+
+    callback_payload = parse_callback_json(callback)
+    payment_id, payment = find_payment_by_payload(callback_payload)
+    if payment_id and payment:
+        return payment_id, payment
+
+    subscription_id = get_callback_value(callback, "subscriptionId", "SubscriptionId")
+    if isinstance(subscription_id, str) and subscription_id:
+        payment = get_payment(subscription_id)
+        if payment:
+            return subscription_id, payment
+
+    return None, None
+
+
+def mirror_payment_alias(source_id: str, alias_id: str, payment: dict) -> None:
+    if source_id == alias_id:
+        return
+
+    alias_payment = dict(payment)
+    alias_payment["subscription_id"] = alias_id
+    alias_payment["origin_payment_id"] = source_id
+    upsert_payment(alias_id, **alias_payment)
+
+
 async def platega_api_request(http_method: str, path: str, payload: dict | None = None) -> dict:
     if not PLATEGA_MERCHANT_ID or not PLATEGA_SECRET:
         raise RuntimeError("PLATEGA_MERCHANT_ID / PLATEGA_SECRET не найдены в .env")
@@ -308,18 +416,7 @@ async def platega_api_request(http_method: str, path: str, payload: dict | None 
 
 async def create_transaction(tariff_key: str, user_id: int, user_name: str) -> dict:
     tariff = TARIFFS[tariff_key]
-    payload = {
-        "paymentDetails": {
-            "amount": float(tariff["amount_rub"]),
-            "currency": "RUB",
-        },
-        "description": f"Доступ в канал: {tariff['label']}",
-        "return": get_return_url(),
-        "failedUrl": get_failed_url(),
-        "payload": json.dumps({"user_id": user_id, "tariff_key": tariff_key}, ensure_ascii=False),
-        "metadata": {"userId": str(user_id), "userName": user_name},
-    }
-
+    payload = build_platega_payload(tariff, user_id, user_name, tariff_key)
     return await platega_api_request("POST", "/v2/transaction/process", payload)
 
 
@@ -551,26 +648,36 @@ async def run_manual_webhook() -> None:
         except Exception:
             return JSONResponse({"error": "invalid json"}, status_code=400)
 
-        invoice_id = str(callback.get("id", ""))
-        status = callback.get("status")
-        payment = get_payment(invoice_id)
+        callback_id = str(get_callback_value(callback, "id", "Id") or "")
+        subscription_id = str(get_callback_value(callback, "subscriptionId", "SubscriptionId") or "")
+        status = normalize_callback_status(get_callback_value(callback, "status", "Status"))
+        payment_id, payment = resolve_callback_payment(callback)
 
         if not payment:
             return JSONResponse({"ok": True})
 
-        upsert_payment(
-            invoice_id,
-            status=status,
-            paid_amount=callback.get("amount"),
-            paid_currency=callback.get("currency"),
-        )
+        update_fields = {
+            "status": status,
+            "paid_amount": get_callback_value(callback, "amount", "Amount"),
+            "paid_currency": get_callback_value(callback, "currency", "Currency"),
+            "subscription_id": subscription_id or payment.get("subscription_id"),
+        }
+        target_ids = {payment_id, subscription_id, callback_id}
+        for target_id in target_ids:
+            if target_id:
+                upsert_payment(target_id, **update_fields)
 
-        if status == "CONFIRMED" and not payment.get("delivered"):
+        if subscription_id and payment_id and subscription_id != payment_id:
+            mirror_payment_alias(payment_id, subscription_id, payment)
+
+        if status in {"CONFIRMED", "SUBSCRIPTION_ACTIVATED"} and not payment.get("delivered"):
             tariff = TARIFFS.get(payment.get("tariff_key", ""))
             chat_id = payment.get("user_id")
 
             if tariff and chat_id:
-                upsert_payment(invoice_id, delivered=True, delivery_link=PAID_CHANNEL_LINK or "")
+                for target_id in target_ids:
+                    if target_id:
+                        upsert_payment(target_id, delivered=True, delivery_link=PAID_CHANNEL_LINK or "")
                 try:
                     await app.bot.send_message(
                         chat_id=chat_id,
@@ -579,7 +686,9 @@ async def run_manual_webhook() -> None:
                     )
                 except Exception:
                     logging.exception("Не удалось отправить сообщение об оплате")
-                    upsert_payment(invoice_id, delivered=False)
+                    for target_id in target_ids:
+                        if target_id:
+                            upsert_payment(target_id, delivered=False)
 
         return JSONResponse({"ok": True})
 
