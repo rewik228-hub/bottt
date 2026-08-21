@@ -323,6 +323,13 @@ async def create_transaction(tariff_key: str, user_id: int, user_name: str) -> d
     return await platega_api_request("POST", "/v2/transaction/process", payload)
 
 
+def extract_payment_url(transaction: dict) -> str:
+    pay_url = transaction.get("url") or transaction.get("redirect")
+    if not isinstance(pay_url, str) or not pay_url.strip():
+        raise ValueError("Platega не вернула ссылку на оплату")
+    return pay_url.strip()
+
+
 async def get_transaction(transaction_id: str) -> dict | None:
     try:
         return await platega_api_request("GET", f"/transaction/{transaction_id}")
@@ -368,7 +375,7 @@ async def handle_tariff_selection(query, tariff_key: str) -> None:
         return
 
     invoice_id = str(transaction["transactionId"])
-    pay_url = transaction["url"]
+    pay_url = extract_payment_url(transaction)
 
     upsert_payment(
         invoice_id,
