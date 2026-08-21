@@ -1,4 +1,5 @@
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -17,9 +18,11 @@ import uvicorn
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CRYPTO_PAY_TOKEN = os.getenv("CRYPTO_PAY_TOKEN")
 PAID_CHANNEL_LINK = os.getenv("PAID_CHANNEL_LINK")
-CRYPTO_PAY_API_URL = os.getenv("CRYPTO_PAY_API_URL", "https://pay.crypt.bot/api")
+PLATEGA_MERCHANT_ID = os.getenv("PLATEGA_MERCHANT_ID")
+PLATEGA_SECRET = os.getenv("PLATEGA_SECRET")
+PLATEGA_API_URL = os.getenv("PLATEGA_API_URL", "https://app.platega.io").rstrip("/")
+PLATEGA_CALLBACK_PATH = os.getenv("PLATEGA_CALLBACK_PATH", "/platega/callback")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/telegram-webhook")
 HEALTHCHECK_PATH = os.getenv("HEALTHCHECK_PATH", "/healthz")
@@ -227,7 +230,7 @@ def expired_invoice_keyboard(tariff_key: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
-def build_invoice_text(tariff: dict, invoice: dict) -> str:
+def build_invoice_text(tariff: dict, invoice_id: str) -> str:
     return (
         f"Тариф: {tariff['label']}\n"
         f"Сумма: {tariff['amount_rub']} RUB\n"
@@ -235,7 +238,7 @@ def build_invoice_text(tariff: dict, invoice: dict) -> str:
         "1. Нажми кнопку «Оплатить».\n"
         "2. После оплаты вернись в бота.\n"
         "3. Нажми «Проверить оплату», чтобы получить доступ.\n\n"
-        f"Счет №{invoice['invoice_id']} действует примерно 1 час."
+        f"Счет №{invoice_id[:8]} действует примерно 15 минут."
     )
 
 
@@ -265,51 +268,73 @@ def build_expired_text(tariff: dict) -> str:
     )
 
 
-async def crypto_api_request(method: str, payload: dict | None = None) -> object:
-    if not CRYPTO_PAY_TOKEN:
-        raise RuntimeError("CRYPTO_PAY_TOKEN не найден в .env")
+BOT_USERNAME: str | None = None
 
-    headers = {"Crypto-Pay-API-Token": CRYPTO_PAY_TOKEN}
+
+async def cache_bot_username(bot) -> None:
+    global BOT_USERNAME
+    try:
+        me = await bot.get_me()
+        BOT_USERNAME = me.username
+    except Exception:
+        logging.exception("Не удалось получить username бота")
+
+
+def get_return_url() -> str:
+    configured = os.getenv("PLATEGA_RETURN_URL")
+    if configured:
+        return configured
+    if BOT_USERNAME:
+        return f"https://t.me/{BOT_USERNAME}"
+    return "https://t.me"
+
+
+def get_failed_url() -> str:
+    return os.getenv("PLATEGA_FAILED_URL") or get_return_url()
+
+
+async def platega_api_request(http_method: str, path: str, payload: dict | None = None) -> dict:
+    if not PLATEGA_MERCHANT_ID or not PLATEGA_SECRET:
+        raise RuntimeError("PLATEGA_MERCHANT_ID / PLATEGA_SECRET не найдены в .env")
+
+    headers = {"X-MerchantId": PLATEGA_MERCHANT_ID, "X-Secret": PLATEGA_SECRET}
 
     async with httpx.AsyncClient(timeout=20.0) as client:
-        response = await client.post(
-            f"{CRYPTO_PAY_API_URL}/{method}",
+        response = await client.request(
+            http_method,
+            f"{PLATEGA_API_URL}{path}",
             headers=headers,
-            json=payload or {},
+            json=payload,
         )
         response.raise_for_status()
 
-    data = response.json()
-    if not data.get("ok"):
-        raise RuntimeError(data.get("error", "Неизвестная ошибка Crypto Pay API"))
-
-    return data["result"]
+    return response.json()
 
 
-async def create_invoice(tariff_key: str, user_id: int) -> dict:
+async def create_transaction(tariff_key: str, user_id: int, user_name: str) -> dict:
     tariff = TARIFFS[tariff_key]
     payload = {
-        "currency_type": "fiat",
-        "fiat": "RUB",
-        "accepted_assets": "USDT,TON,BTC,ETH,LTC,BNB,TRX,USDC",
-        "amount": tariff["amount_rub"],
+        "paymentDetails": {
+            "amount": float(tariff["amount_rub"]),
+            "currency": "RUB",
+        },
         "description": f"Доступ в канал: {tariff['label']}",
-        "hidden_message": "Оплата получена. Вернитесь в бота и нажмите «Проверить оплату».",
+        "return": get_return_url(),
+        "failedUrl": get_failed_url(),
         "payload": json.dumps({"user_id": user_id, "tariff_key": tariff_key}, ensure_ascii=False),
-        "allow_comments": False,
-        "allow_anonymous": False,
-        "expires_in": 3600,
+        "metadata": {"userId": str(user_id), "userName": user_name},
     }
 
-    result = await crypto_api_request("createInvoice", payload)
-    return result
+    return await platega_api_request("POST", "/v2/transaction/process", payload)
 
 
-async def get_invoice(invoice_id: str) -> dict | None:
-    result = await crypto_api_request("getInvoices", {"invoice_ids": str(invoice_id)})
-    if not isinstance(result, list) or not result:
-        return None
-    return result[0]
+async def get_transaction(transaction_id: str) -> dict | None:
+    try:
+        return await platega_api_request("GET", f"/transaction/{transaction_id}")
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            return None
+        raise
 
 
 async def show_main_menu(query) -> None:
@@ -342,33 +367,34 @@ async def show_user_agreement(query) -> None:
 
 async def handle_tariff_selection(query, tariff_key: str) -> None:
     tariff = TARIFFS[tariff_key]
+    user = query.from_user
+    user_name = f"@{user.username}" if user.username else user.full_name
 
     try:
-        invoice = await create_invoice(tariff_key, query.from_user.id)
+        transaction = await create_transaction(tariff_key, user.id, user_name)
     except Exception:
-        logging.exception("Не удалось создать счет Crypto Bot")
+        logging.exception("Не удалось создать транзакцию Platega")
         await query.edit_message_text(
             "Не удалось создать счет. Попробуй еще раз чуть позже или напиши в поддержку.",
             reply_markup=back_to_main_menu_keyboard(),
         )
         return
 
-    invoice_id = str(invoice["invoice_id"])
-    pay_url = invoice["bot_invoice_url"]
+    invoice_id = str(transaction["transactionId"])
+    pay_url = transaction["url"]
 
     upsert_payment(
         invoice_id,
-        user_id=query.from_user.id,
+        user_id=user.id,
         tariff_key=tariff_key,
         pay_url=pay_url,
-        status=invoice.get("status", "active"),
-        created_at=invoice.get("created_at"),
-        expiration_date=invoice.get("expiration_date"),
+        status=transaction.get("status", "PENDING"),
+        expires_in=transaction.get("expiresIn"),
         delivered=False,
     )
 
     await query.edit_message_text(
-        build_invoice_text(tariff, invoice),
+        build_invoice_text(tariff, invoice_id),
         reply_markup=invoice_keyboard(pay_url, invoice_id),
         disable_web_page_preview=True,
     )
@@ -387,29 +413,24 @@ async def handle_invoice_check(query) -> bool:
         return True
 
     try:
-        invoice = await get_invoice(invoice_id)
+        transaction = await get_transaction(invoice_id)
     except Exception:
-        logging.exception("Не удалось проверить счет Crypto Bot")
+        logging.exception("Не удалось проверить транзакцию Platega")
         await query.answer("Не удалось проверить оплату. Попробуй еще раз.", show_alert=True)
         return True
 
-    if not invoice:
-        await query.answer("Счет не найден в Crypto Bot.", show_alert=True)
+    if not transaction:
+        await query.answer("Счет не найден в Platega.", show_alert=True)
         return True
 
     tariff = TARIFFS[payment["tariff_key"]]
-    status = invoice.get("status", "active")
+    status = transaction.get("status", "PENDING")
 
-    upsert_payment(
-        invoice_id,
-        status=status,
-        paid_at=invoice.get("paid_at"),
-        paid_asset=invoice.get("paid_asset"),
-        paid_amount=invoice.get("paid_amount"),
-    )
+    upsert_payment(invoice_id, status=status)
 
-    if status == "paid":
-        upsert_payment(invoice_id, delivered=True, delivery_link=PAID_CHANNEL_LINK or "")
+    if status == "CONFIRMED":
+        if not payment.get("delivered"):
+            upsert_payment(invoice_id, delivered=True, delivery_link=PAID_CHANNEL_LINK or "")
         await query.edit_message_text(
             build_paid_text(tariff),
             reply_markup=paid_keyboard(),
@@ -417,7 +438,7 @@ async def handle_invoice_check(query) -> bool:
         )
         return False
 
-    if status == "expired":
+    if status in {"CANCELED", "CHARGEBACKED"}:
         await query.edit_message_text(
             build_expired_text(tariff),
             reply_markup=expired_invoice_keyboard(payment["tariff_key"]),
@@ -425,7 +446,7 @@ async def handle_invoice_check(query) -> bool:
         return False
 
     await query.edit_message_text(
-        build_invoice_text(tariff, invoice),
+        build_invoice_text(tariff, invoice_id),
         reply_markup=invoice_keyboard(payment["pay_url"], invoice_id),
         disable_web_page_preview=True,
     )
@@ -509,7 +530,9 @@ async def keep_service_awake(healthcheck_url: str) -> None:
 async def run_manual_webhook() -> None:
     webhook_path = normalize_path(WEBHOOK_PATH, "telegram-webhook")
     healthcheck_path = normalize_path(HEALTHCHECK_PATH, "healthz")
+    platega_callback_path = normalize_path(PLATEGA_CALLBACK_PATH, "platega/callback")
     public_webhook_url = f"{WEBHOOK_URL.rstrip('/')}{webhook_path}"
+    platega_callback_url = f"{WEBHOOK_URL.rstrip('/')}{platega_callback_path}"
     healthcheck_url = f"{WEBHOOK_URL.rstrip('/')}{healthcheck_path}"
     app = build_application(manual_webhook=True)
 
@@ -518,12 +541,63 @@ async def run_manual_webhook() -> None:
         await app.update_queue.put(update)
         return Response(status_code=200)
 
+    async def platega_callback(request: Request) -> JSONResponse:
+        merchant_id = request.headers.get("X-MerchantId") or ""
+        secret = request.headers.get("X-Secret") or ""
+        expected_id = PLATEGA_MERCHANT_ID or ""
+        expected_secret = PLATEGA_SECRET or ""
+        if not (
+            merchant_id
+            and secret
+            and hmac.compare_digest(merchant_id, expected_id)
+            and hmac.compare_digest(secret, expected_secret)
+        ):
+            return JSONResponse({"error": "unauthorized"}, status_code=403)
+
+        try:
+            callback = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid json"}, status_code=400)
+
+        invoice_id = str(callback.get("id", ""))
+        status = callback.get("status")
+        payment = get_payment(invoice_id)
+
+        if not payment:
+            return JSONResponse({"ok": True})
+
+        upsert_payment(
+            invoice_id,
+            status=status,
+            paid_amount=callback.get("amount"),
+            paid_currency=callback.get("currency"),
+        )
+
+        if status == "CONFIRMED" and not payment.get("delivered"):
+            tariff = TARIFFS.get(payment.get("tariff_key", ""))
+            chat_id = payment.get("user_id")
+
+            if tariff and chat_id:
+                upsert_payment(invoice_id, delivered=True, delivery_link=PAID_CHANNEL_LINK or "")
+                try:
+                    await app.bot.send_message(
+                        chat_id=chat_id,
+                        text=build_paid_text(tariff),
+                        reply_markup=paid_keyboard(),
+                    )
+                except Exception:
+                    logging.exception("Не удалось отправить сообщение об оплате")
+                    upsert_payment(invoice_id, delivered=False)
+
+        return JSONResponse({"ok": True})
+
     async def healthcheck(request: Request) -> JSONResponse:
         return JSONResponse({"status": "ok"})
 
     web_app = Starlette(
         routes=[
             Route(webhook_path, telegram_webhook, methods=["POST"]),
+            Route(platega_callback_path, platega_callback, methods=["POST"]),
             Route(healthcheck_path, healthcheck, methods=["GET"]),
         ]
     )
@@ -538,12 +612,14 @@ async def run_manual_webhook() -> None:
 
     async with app:
         await app.start()
+        await cache_bot_username(app.bot)
         await app.bot.set_webhook(
             url=public_webhook_url,
             allowed_updates=Update.ALL_TYPES,
         )
         logging.info("Bot is running in webhook mode on port %s", PORT)
         logging.info("Webhook URL: %s", public_webhook_url)
+        logging.info("Platega callback URL: %s", platega_callback_url)
         logging.info("Healthcheck URL: %s", healthcheck_url)
 
         keepalive_task = None
@@ -562,13 +638,17 @@ async def run_manual_webhook() -> None:
             await app.stop()
 
 
+async def post_init(application: Application) -> None:
+    await cache_bot_username(application.bot)
+
+
 def main() -> None:
     if not BOT_TOKEN:
         logging.error("BOT_TOKEN не найден в .env")
         return
 
-    if not CRYPTO_PAY_TOKEN:
-        logging.error("CRYPTO_PAY_TOKEN не найден в .env")
+    if not PLATEGA_MERCHANT_ID or not PLATEGA_SECRET:
+        logging.error("PLATEGA_MERCHANT_ID / PLATEGA_SECRET не найдены в .env")
         return
 
     logging.basicConfig(level=logging.INFO)
@@ -578,8 +658,9 @@ def main() -> None:
         return
 
     logging.info("WEBHOOK_URL не задан. Запускаю бота в polling mode.")
+    logging.info("Callback от Platega недоступен без WEBHOOK_URL, оплата подтверждается кнопкой «Проверить оплату».")
     app = build_application()
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, post_init=post_init)
 
 
 if __name__ == "__main__":
