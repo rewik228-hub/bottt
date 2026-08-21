@@ -117,7 +117,7 @@ TARIFFS = {
     "tariff_day": {
         "label": "1 день",
         "amount_rub": "350",
-        "description": "Подписка с автопродлением каждый день",
+        "description": "Подписка на 1 день",
         "success_title": "Подписка на 1 день активирована.",
         "interval_days": 1,
         "recurring": True,
@@ -125,15 +125,15 @@ TARIFFS = {
     "tariff_week": {
         "label": "1 неделя",
         "amount_rub": "700",
-        "description": "Подписка с автопродлением раз в 7 дней",
-        "success_title": "Подписка на 1 неделю активирована.",
+        "description": "Подписка на 7 дней",
+        "success_title": "Подписка на 7 дней активирована.",
         "interval_days": 7,
         "recurring": True,
     },
     "tariff_month": {
         "label": "Месяц",
         "amount_rub": "1200",
-        "description": "Подписка с автопродлением раз в 30 дней",
+        "description": "Подписка на 1 месяц",
         "success_title": "Подписка на месяц активирована.",
         "interval_days": 30,
         "recurring": True,
@@ -141,7 +141,7 @@ TARIFFS = {
     "tariff_forever": {
         "label": "Навсегда",
         "amount_rub": "2700",
-        "description": "Разовый доступ без автопродления",
+        "description": "Подписка навсегда",
         "success_title": "Оплата тарифа навсегда подтверждена.",
         "recurring": False,
     },
@@ -149,10 +149,10 @@ TARIFFS = {
 
 TARIFFS_TEXT = (
     "Выбери удобную подписку:\n\n"
-    "1 день - 350 RUB (автопродление каждый день)\n\n"
-    "1 неделя - 700 RUB (автопродление раз в 7 дней)\n\n"
-    "Месяц - 1200 RUB (автопродление раз в 30 дней)\n\n"
-    "Навсегда - 2700 RUB (разовый доступ без автопродления)"
+    "1 день - 350 RUB \n\n"
+    "1 неделя - 700 RUB \n\n"
+    "Месяц - 1200 RUB \n\n"
+    "Навсегда - 2700 RUB"
 )
 
 
