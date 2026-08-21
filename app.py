@@ -101,18 +101,14 @@ SUPPORT_TEXT = (
 )
 
 WELCOME_TEXT = (
-    "PLAT\n\n"
     "Всем приветик\n\n"
     "Это бот для покупки доступа в приватный канал (18+).\n\n"
     "Выбирай удобный тариф, оплачивай и после подтверждения оплаты бот выдаст ссылку на канал."
 )
 
-PRIVACY_POLICY_TEXT = (
+DOCUMENTS_TEXT = (
     "Политика конфиденциальности:\n"
-    f"{PRIVACY_POLICY_URL}"
-)
-
-USER_AGREEMENT_TEXT = (
+    f"{PRIVACY_POLICY_URL}\n\n"
     "Пользовательское соглашение:\n"
     f"{USER_AGREEMENT_URL}"
 )
@@ -180,8 +176,7 @@ def upsert_payment(invoice_id: str, **changes: object) -> dict:
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     keyboard = [
         [InlineKeyboardButton("Купить доступ", callback_data="buy")],
-        [InlineKeyboardButton("Политика конфиденциальности", callback_data="privacy_policy")],
-        [InlineKeyboardButton("Пользовательское соглашение", callback_data="user_agreement")],
+        [InlineKeyboardButton("Документы", callback_data="documents")],
         [InlineKeyboardButton("Поддержка", callback_data="support")],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -349,17 +344,9 @@ async def show_support(query) -> None:
     await query.edit_message_text(SUPPORT_TEXT, reply_markup=back_to_main_menu_keyboard())
 
 
-async def show_privacy_policy(query) -> None:
+async def show_documents(query) -> None:
     await query.edit_message_text(
-        PRIVACY_POLICY_TEXT,
-        reply_markup=back_to_main_menu_keyboard(),
-        disable_web_page_preview=True,
-    )
-
-
-async def show_user_agreement(query) -> None:
-    await query.edit_message_text(
-        USER_AGREEMENT_TEXT,
+        DOCUMENTS_TEXT,
         reply_markup=back_to_main_menu_keyboard(),
         disable_web_page_preview=True,
     )
@@ -467,10 +454,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await show_main_menu(query)
         elif data == "buy":
             await show_tariffs(query)
-        elif data == "privacy_policy":
-            await show_privacy_policy(query)
-        elif data == "user_agreement":
-            await show_user_agreement(query)
+        elif data in {"privacy_policy", "user_agreement", "documents"}:
+            await show_documents(query)
         elif data == "support":
             await show_support(query)
         elif data in TARIFFS:
