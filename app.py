@@ -510,6 +510,9 @@ def admin_home_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("Снять доступ", callback_data="admin:revoke"),
             ],
             [
+                InlineKeyboardButton("Рассылка", callback_data="admin:broadcast"),
+            ],
+            [
                 InlineKeyboardButton("Обновить", callback_data="admin:home"),
                 InlineKeyboardButton("Закрыть", callback_data="admin:close"),
             ],
@@ -638,6 +641,14 @@ def build_admin_revoke_help_text() -> str:
         "`user_id`\n"
         "или\n"
         "`@username`"
+    )
+
+
+def build_admin_broadcast_help_text() -> str:
+    return (
+        "Массовая рассылка\n\n"
+        "Отправь следующим сообщением текст, который нужно разослать всем пользователям из базы бота.\n\n"
+        "Сообщение уйдет как обычный текст с сохранением переносов строк."
     )
 
 
@@ -1096,6 +1107,18 @@ async def ensure_join_request_link(bot, user_id: int, access_record: dict) -> di
     )
 
 
+async def get_access_record_for_display(bot, user_id: int) -> dict | None:
+    access_record = get_access_record(user_id)
+    if not access_record or not has_active_access(access_record):
+        return access_record
+
+    try:
+        return await ensure_join_request_link(bot, user_id, access_record)
+    except Exception:
+        logging.exception("Не удалось подготовить данные доступа для пользователя %s", user_id)
+        return get_access_record(user_id) or access_record
+
+
 async def sync_paid_access(bot, payment_id: str) -> tuple[dict | None, dict | None]:
     payment = get_payment(payment_id)
     if not payment:
@@ -1354,9 +1377,7 @@ async def show_documents(query) -> None:
 
 
 async def show_access_status(query) -> None:
-    access_record = get_access_record(query.from_user.id)
-    if access_record and has_active_access(access_record):
-        access_record = await ensure_join_request_link(query.bot, query.from_user.id, access_record)
+    access_record = await get_access_record_for_display(query.bot, query.from_user.id)
 
     await safe_edit_query_message(
         query,
@@ -1469,9 +1490,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     remember_user(update.effective_user, last_action="status")
-    access_record = get_access_record(update.effective_user.id)
-    if access_record and has_active_access(access_record):
-        access_record = await ensure_join_request_link(context.bot, update.effective_user.id, access_record)
+    access_record = await get_access_record_for_display(context.bot, update.effective_user.id)
 
     await update.message.reply_text(
         access_status_text(access_record),
@@ -1583,6 +1602,48 @@ async def process_admin_revoke_message(
     )
 
 
+async def process_admin_broadcast_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    raw_text: str,
+) -> tuple[bool, str]:
+    message_text = raw_text.strip()
+    if not message_text:
+        return False, "Текст рассылки пустой. Отправь обычное сообщение с текстом для всех пользователей."
+
+    user_ids = collect_known_user_ids()
+    if not user_ids:
+        return False, "В базе пока нет пользователей для рассылки."
+
+    sent_count = 0
+    failed_ids: list[int] = []
+
+    for user_id in user_ids:
+        try:
+            for chunk in split_text_for_telegram(message_text):
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=chunk,
+                    disable_web_page_preview=True,
+                )
+            sent_count += 1
+        except Exception:
+            failed_ids.append(user_id)
+            logging.exception("Не удалось отправить рассылку пользователю %s", user_id)
+
+    failed_preview = ", ".join(str(user_id) for user_id in failed_ids[:10])
+    lines = [
+        "Рассылка завершена.",
+        f"Всего пользователей в базе: {len(user_ids)}",
+        f"Успешно отправлено: {sent_count}",
+        f"Не удалось отправить: {len(failed_ids)}",
+    ]
+    if failed_preview:
+        suffix = "..." if len(failed_ids) > 10 else ""
+        lines.append(f"Проблемные ID: {failed_preview}{suffix}")
+    return True, "\n".join(lines)
+
+
 async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type != "private" or not is_admin_user(update.effective_user.id):
         return
@@ -1601,6 +1662,9 @@ async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif admin_state.get("action") == "revoke":
         success, notice = await process_admin_revoke_message(update, context, raw_text)
         help_text = build_admin_revoke_help_text()
+    elif admin_state.get("action") == "broadcast":
+        success, notice = await process_admin_broadcast_message(update, context, raw_text)
+        help_text = build_admin_broadcast_help_text()
     else:
         context.user_data.pop(ADMIN_STATE_KEY, None)
         await upsert_admin_panel_message(
@@ -1662,6 +1726,14 @@ async def handle_admin_callback(query, context: ContextTypes.DEFAULT_TYPE) -> bo
         await safe_edit_query_message(
             query,
             build_admin_revoke_help_text(),
+            reply_markup=admin_input_keyboard(),
+            disable_web_page_preview=True,
+        )
+    elif data == "admin:broadcast":
+        context.user_data[ADMIN_STATE_KEY] = {"action": "broadcast"}
+        await safe_edit_query_message(
+            query,
+            build_admin_broadcast_help_text(),
             reply_markup=admin_input_keyboard(),
             disable_web_page_preview=True,
         )
