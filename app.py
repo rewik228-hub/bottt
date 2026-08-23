@@ -3,6 +3,7 @@ import hmac
 import json
 import logging
 import os
+import re
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -20,6 +21,8 @@ from telegram.ext import (
     ChatJoinRequestHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 import uvicorn
 
@@ -29,6 +32,14 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 PAID_CHANNEL_LINK = os.getenv("PAID_CHANNEL_LINK")
 PAID_CHAT_ID_RAW = os.getenv("PAID_CHAT_ID", "").strip()
 PAID_CHAT_ID = int(PAID_CHAT_ID_RAW) if PAID_CHAT_ID_RAW else None
+ADMIN_USER_IDS_RAW = os.getenv("ADMIN_USER_IDS", "").strip()
+ADMIN_USER_IDS = {
+    int(chunk.strip())
+    for chunk in ADMIN_USER_IDS_RAW.split(",")
+    if chunk.strip().isdigit()
+}
+ADMIN_PANEL_COMMAND = (os.getenv("ADMIN_PANEL_COMMAND") or "roomcontrol").strip().lstrip("/") or "roomcontrol"
+ADMIN_PAGE_SIZE = max(1, int(os.getenv("ADMIN_PAGE_SIZE", "8")))
 PLATEGA_MERCHANT_ID = os.getenv("PLATEGA_MERCHANT_ID")
 PLATEGA_SECRET = os.getenv("PLATEGA_SECRET")
 PLATEGA_API_URL = os.getenv("PLATEGA_API_URL", "https://app.platega.io").rstrip("/")
@@ -58,6 +69,9 @@ try:
 except ZoneInfoNotFoundError:
     MOSCOW_TZ = timezone(timedelta(hours=3), name="MSK")
 ACCESS_LOOP_TASK_KEY = "access_loop_task"
+ADMIN_STATE_KEY = "admin_state"
+ADMIN_PANEL_MESSAGE_ID_KEY = "admin_panel_message_id"
+ADMIN_PANEL_CHAT_ID_KEY = "admin_panel_chat_id"
 
 
 def load_static_text(path: Path, fallback_text: str) -> str:
@@ -205,27 +219,29 @@ def format_datetime_local(value: datetime | None) -> str:
 
 def load_storage() -> dict[str, dict[str, dict]]:
     if not PAYMENTS_FILE.exists():
-        return {"payments": {}, "access": {}}
+        return {"payments": {}, "access": {}, "users": {}}
 
     try:
         raw_data = json.loads(PAYMENTS_FILE.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         logging.warning("payments.json поврежден, создаю новое хранилище.")
-        return {"payments": {}, "access": {}}
+        return {"payments": {}, "access": {}, "users": {}}
 
     if not isinstance(raw_data, dict):
-        return {"payments": {}, "access": {}}
+        return {"payments": {}, "access": {}, "users": {}}
 
     payments = raw_data.get("payments")
     access = raw_data.get("access")
+    users = raw_data.get("users")
 
-    if isinstance(payments, dict) or isinstance(access, dict):
+    if isinstance(payments, dict) or isinstance(access, dict) or isinstance(users, dict):
         return {
             "payments": payments if isinstance(payments, dict) else {},
             "access": access if isinstance(access, dict) else {},
+            "users": users if isinstance(users, dict) else {},
         }
 
-    return {"payments": raw_data, "access": {}}
+    return {"payments": raw_data, "access": {}, "users": {}}
 
 
 def save_storage(storage: dict[str, dict[str, dict]]) -> None:
@@ -255,6 +271,16 @@ def save_access_records(access_records: dict[str, dict]) -> None:
     save_storage(storage)
 
 
+def load_user_records() -> dict[str, dict]:
+    return load_storage()["users"]
+
+
+def save_user_records(user_records: dict[str, dict]) -> None:
+    storage = load_storage()
+    storage["users"] = user_records
+    save_storage(storage)
+
+
 def get_payment(invoice_id: str) -> dict | None:
     return load_payments().get(str(invoice_id))
 
@@ -272,6 +298,10 @@ def get_access_record(user_id: int) -> dict | None:
     return load_access_records().get(str(user_id))
 
 
+def get_user_record(user_id: int) -> dict | None:
+    return load_user_records().get(str(user_id))
+
+
 def upsert_access_record(user_id: int, **changes: object) -> dict:
     access_records = load_access_records()
     access_record = access_records.get(str(user_id), {})
@@ -279,6 +309,54 @@ def upsert_access_record(user_id: int, **changes: object) -> dict:
     access_records[str(user_id)] = access_record
     save_access_records(access_records)
     return access_record
+
+
+def upsert_user_record(user_id: int, **changes: object) -> dict:
+    user_records = load_user_records()
+    user_record = user_records.get(str(user_id), {})
+    user_record.update(changes)
+    user_records[str(user_id)] = user_record
+    save_user_records(user_records)
+    return user_record
+
+
+def remember_user(user, *, last_action: str | None = None) -> None:
+    if not user:
+        return
+
+    now = serialize_datetime(utc_now())
+    existing_user = get_user_record(user.id) or {}
+    upsert_user_record(
+        user.id,
+        username=user.username or existing_user.get("username"),
+        first_name=user.first_name or existing_user.get("first_name"),
+        last_name=user.last_name or existing_user.get("last_name"),
+        full_name=user.full_name or existing_user.get("full_name"),
+        language_code=user.language_code or existing_user.get("language_code"),
+        is_bot=bool(user.is_bot),
+        first_seen_at=existing_user.get("first_seen_at") or now,
+        last_seen_at=now,
+        last_action=last_action or existing_user.get("last_action"),
+    )
+
+
+def collect_known_user_ids() -> list[int]:
+    user_ids: set[int] = set()
+
+    for raw_user_id in load_user_records():
+        if raw_user_id.lstrip("-").isdigit():
+            user_ids.add(int(raw_user_id))
+
+    for raw_user_id in load_access_records():
+        if raw_user_id.lstrip("-").isdigit():
+            user_ids.add(int(raw_user_id))
+
+    for payment in load_payments().values():
+        user_id = payment.get("user_id")
+        if isinstance(user_id, int):
+            user_ids.add(user_id)
+
+    return sorted(user_ids)
 
 
 def get_access_expires_at(access_record: dict | None) -> datetime | None:
@@ -322,6 +400,372 @@ def access_status_text(access_record: dict | None) -> str:
     )
 
 
+def is_admin_user(user_id: int | None) -> bool:
+    return user_id is not None and user_id in ADMIN_USER_IDS
+
+
+def build_user_display_name(user_id: int, user_record: dict | None = None) -> str:
+    user_record = user_record or {}
+    full_name = user_record.get("full_name") or user_record.get("first_name")
+    username = user_record.get("username")
+
+    if full_name and username:
+        return f"{full_name} (@{username})"
+    if full_name:
+        return str(full_name)
+    if username:
+        return f"@{username}"
+    return f"Пользователь {user_id}"
+
+
+def access_status_brief(access_record: dict | None) -> str:
+    if not access_record:
+        return "нет доступа"
+
+    if has_active_access(access_record):
+        expires_at = get_access_expires_at(access_record)
+        if expires_at is None:
+            return "активен навсегда"
+        return f"активен до {format_datetime_local(expires_at)}"
+
+    expires_at = get_access_expires_at(access_record)
+    if expires_at is None:
+        return "неактивен"
+    return f"истек {format_datetime_local(expires_at)}"
+
+
+def membership_status_brief(access_record: dict | None) -> str:
+    if not access_record:
+        return "не в приватке"
+    if access_record.get("is_member"):
+        return "в канале"
+    if has_active_access(access_record):
+        return "доступ активен, вход не завершен"
+    return "доступ снят"
+
+
+def get_known_user_snapshots() -> list[dict]:
+    snapshots: list[dict] = []
+
+    for user_id in collect_known_user_ids():
+        snapshots.append(
+            {
+                "user_id": user_id,
+                "user_record": get_user_record(user_id) or {},
+                "access_record": get_access_record(user_id) or {},
+            }
+        )
+
+    return snapshots
+
+
+def build_admin_home_text() -> str:
+    snapshots = get_known_user_snapshots()
+    active_count = sum(1 for snapshot in snapshots if has_active_access(snapshot["access_record"]))
+    member_count = sum(1 for snapshot in snapshots if snapshot["access_record"].get("is_member"))
+    expired_count = sum(
+        1
+        for snapshot in snapshots
+        if snapshot["access_record"] and not has_active_access(snapshot["access_record"])
+    )
+
+    lines = [
+        "Скрытая админ-панель",
+        "",
+        f"Пользователей в базе: {len(snapshots)}",
+        f"Активных доступов: {active_count}",
+        f"Сейчас в приватке: {member_count}",
+        f"Истекших или снятых доступов: {expired_count}",
+        "",
+        "Панель открывается только по твоей кастомной команде и приходит отдельным сообщением.",
+    ]
+    return "\n".join(lines)
+
+
+def admin_home_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Активные доступы", callback_data="admin:list:active:0"),
+                InlineKeyboardButton("Все пользователи", callback_data="admin:list:all:0"),
+            ],
+            [
+                InlineKeyboardButton("Выдать доступ", callback_data="admin:grant"),
+                InlineKeyboardButton("Снять доступ", callback_data="admin:revoke"),
+            ],
+            [
+                InlineKeyboardButton("Обновить", callback_data="admin:home"),
+                InlineKeyboardButton("Закрыть", callback_data="admin:close"),
+            ],
+        ]
+    )
+
+
+def admin_input_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("◀ Назад", callback_data="admin:home")],
+            [InlineKeyboardButton("Закрыть", callback_data="admin:close")],
+        ]
+    )
+
+
+def build_admin_user_list(mode: str, page: int) -> tuple[str, InlineKeyboardMarkup]:
+    snapshots = get_known_user_snapshots()
+
+    if mode == "active":
+        title = "Активные доступы"
+        snapshots = [
+            snapshot for snapshot in snapshots if has_active_access(snapshot["access_record"])
+        ]
+        snapshots.sort(
+            key=lambda snapshot: (
+                get_access_expires_at(snapshot["access_record"]) is not None,
+                get_access_expires_at(snapshot["access_record"]) or datetime.max.replace(tzinfo=UTC),
+                snapshot["user_id"],
+            )
+        )
+    else:
+        title = "Все пользователи"
+        snapshots.sort(
+            key=lambda snapshot: (
+                parse_datetime(snapshot["user_record"].get("last_seen_at")) or datetime.min.replace(tzinfo=UTC),
+                snapshot["user_id"],
+            ),
+            reverse=True,
+        )
+
+    total_items = len(snapshots)
+    total_pages = max(1, (total_items + ADMIN_PAGE_SIZE - 1) // ADMIN_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start_index = page * ADMIN_PAGE_SIZE
+    end_index = start_index + ADMIN_PAGE_SIZE
+    page_items = snapshots[start_index:end_index]
+
+    lines = [f"{title} ({total_items})", ""]
+
+    if not page_items:
+        lines.append("Список пока пуст.")
+    else:
+        for index, snapshot in enumerate(page_items, start=start_index + 1):
+            user_id = snapshot["user_id"]
+            user_record = snapshot["user_record"]
+            access_record = snapshot["access_record"]
+            last_seen_at = parse_datetime(user_record.get("last_seen_at"))
+            lines.extend(
+                [
+                    f"{index}. {build_user_display_name(user_id, user_record)}",
+                    f"ID: {user_id}",
+                    f"Доступ: {access_status_brief(access_record)}",
+                    f"Статус: {membership_status_brief(access_record)}",
+                    (
+                        f"Последняя активность: {format_datetime_local(last_seen_at)}"
+                        if last_seen_at
+                        else "Последняя активность: неизвестно"
+                    ),
+                    "",
+                ]
+            )
+
+    lines.append(f"Страница {page + 1}/{total_pages}")
+
+    navigation_row: list[InlineKeyboardButton] = []
+    if page > 0:
+        navigation_row.append(
+            InlineKeyboardButton("◀", callback_data=f"admin:list:{mode}:{page - 1}")
+        )
+    if page < total_pages - 1:
+        navigation_row.append(
+            InlineKeyboardButton("▶", callback_data=f"admin:list:{mode}:{page + 1}")
+        )
+
+    keyboard_rows: list[list[InlineKeyboardButton]] = []
+    if navigation_row:
+        keyboard_rows.append(navigation_row)
+    keyboard_rows.append([InlineKeyboardButton("◀ Назад", callback_data="admin:home")])
+    keyboard_rows.append(
+        [
+            InlineKeyboardButton("Выдать доступ", callback_data="admin:grant"),
+            InlineKeyboardButton("Снять доступ", callback_data="admin:revoke"),
+        ]
+    )
+    keyboard_rows.append([InlineKeyboardButton("Закрыть", callback_data="admin:close")])
+
+    return "\n".join(lines).strip(), InlineKeyboardMarkup(keyboard_rows)
+
+
+def build_admin_grant_help_text() -> str:
+    return (
+        "Выдача доступа\n\n"
+        "Отправь следующим сообщением:\n"
+        "`user_id срок`\n\n"
+        "Примеры:\n"
+        "`123456789 tariff_week`\n"
+        "`@username tariff_month`\n"
+        "`123456789 1m`\n"
+        "`123456789 1h`\n"
+        "`123456789 3d`\n"
+        "`123456789 2w`\n"
+        "`123456789 1mo`\n"
+        "`123456789 forever`\n\n"
+        "Поддерживаются значения:\n"
+        "`tariff_day`, `tariff_week`, `tariff_month`, `tariff_forever`, `forever`\n"
+        "и произвольные сроки:\n"
+        "`m` = минуты, `h` = часы, `d` = дни, `w` = недели, `mo` = месяцы по 30 дней"
+    )
+
+
+def build_admin_revoke_help_text() -> str:
+    return (
+        "Снятие доступа\n\n"
+        "Отправь следующим сообщением:\n"
+        "`user_id`\n"
+        "или\n"
+        "`@username`"
+    )
+
+
+def remember_admin_panel_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int) -> None:
+    context.user_data[ADMIN_PANEL_CHAT_ID_KEY] = chat_id
+    context.user_data[ADMIN_PANEL_MESSAGE_ID_KEY] = message_id
+
+
+async def upsert_admin_panel_message(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    text: str,
+    reply_markup: InlineKeyboardMarkup,
+) -> None:
+    stored_chat_id = context.user_data.get(ADMIN_PANEL_CHAT_ID_KEY)
+    stored_message_id = context.user_data.get(ADMIN_PANEL_MESSAGE_ID_KEY)
+
+    if stored_chat_id == chat_id and isinstance(stored_message_id, int):
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=stored_message_id,
+                text=text,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            )
+            return
+        except Exception:
+            logging.exception("Не удалось обновить сообщение админ-панели")
+
+    sent_message = await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=reply_markup,
+        disable_web_page_preview=True,
+    )
+    remember_admin_panel_message(context, chat_id, sent_message.message_id)
+
+
+async def delete_message_safely(message) -> None:
+    if not message:
+        return
+
+    try:
+        await message.delete()
+    except Exception:
+        logging.exception("Не удалось удалить сообщение %s", getattr(message, "message_id", "?"))
+
+
+def normalize_admin_tariff_key(raw_value: str) -> str | None:
+    normalized = raw_value.strip().lower()
+    alias_map = {
+        "tariff_day": "tariff_day",
+        "day": "tariff_day",
+        "1d": "tariff_day",
+        "tariff_week": "tariff_week",
+        "week": "tariff_week",
+        "7d": "tariff_week",
+        "tariff_month": "tariff_month",
+        "month": "tariff_month",
+        "30d": "tariff_month",
+        "tariff_forever": "tariff_forever",
+        "forever": "tariff_forever",
+        "life": "tariff_forever",
+        "navsegda": "tariff_forever",
+    }
+    return alias_map.get(normalized)
+
+
+def parse_admin_duration(raw_value: str) -> dict | None:
+    normalized = raw_value.strip().lower()
+    tariff_key = normalize_admin_tariff_key(normalized)
+    if tariff_key:
+        tariff = TARIFFS[tariff_key]
+        if tariff.get("recurring"):
+            duration = timedelta(days=int(tariff["interval_days"]))
+        else:
+            duration = None
+        return {
+            "tariff_key": tariff_key,
+            "duration": duration,
+            "label": tariff["label"],
+            "is_forever": duration is None,
+        }
+
+    match = re.fullmatch(
+        r"(?P<amount>\d+)\s*(?P<unit>m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks|mo|mon|month|months)",
+        normalized,
+    )
+    if not match:
+        return None
+
+    amount = int(match.group("amount"))
+    unit = match.group("unit")
+    if amount <= 0:
+        return None
+
+    if unit in {"m", "min", "mins", "minute", "minutes"}:
+        duration = timedelta(minutes=amount)
+        label = f"{amount} мин."
+    elif unit in {"h", "hr", "hrs", "hour", "hours"}:
+        duration = timedelta(hours=amount)
+        label = f"{amount} ч."
+    elif unit in {"d", "day", "days"}:
+        duration = timedelta(days=amount)
+        label = f"{amount} дн."
+    elif unit in {"w", "week", "weeks"}:
+        duration = timedelta(weeks=amount)
+        label = f"{amount} нед."
+    else:
+        duration = timedelta(days=amount * 30)
+        label = f"{amount} мес."
+
+    return {
+        "tariff_key": "manual_custom",
+        "duration": duration,
+        "label": label,
+        "is_forever": False,
+    }
+
+
+def resolve_user_reference(raw_value: str) -> int | None:
+    candidate = raw_value.strip()
+    if not candidate:
+        return None
+
+    if candidate.lstrip("-").isdigit():
+        return int(candidate)
+
+    if not candidate.startswith("@"):
+        return None
+
+    username = candidate[1:].strip().lower()
+    if not username:
+        return None
+
+    for raw_user_id, user_record in load_user_records().items():
+        if str(user_record.get("username", "")).strip().lower() == username and raw_user_id.isdigit():
+            return int(raw_user_id)
+
+    return None
+
+
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     keyboard = [
         [InlineKeyboardButton("Купить доступ", callback_data="buy")],
@@ -360,11 +804,12 @@ def invoice_keyboard(pay_url: str, invoice_id: str) -> InlineKeyboardMarkup:
 
 def paid_keyboard(access_record: dict | None = None) -> InlineKeyboardMarkup:
     keyboard = []
+    access_is_active = has_active_access(access_record)
 
     invite_link = access_record.get("invite_link") if access_record else None
-    if invite_link:
+    if access_is_active and invite_link:
         keyboard.append([InlineKeyboardButton("Подать заявку в канал", url=invite_link)])
-    elif PAID_CHANNEL_LINK:
+    elif access_is_active and PAID_CHANNEL_LINK:
         keyboard.append([InlineKeyboardButton("Открыть канал", url=PAID_CHANNEL_LINK)])
 
     keyboard.append([InlineKeyboardButton("Мой доступ", callback_data="access_status")])
@@ -651,7 +1096,47 @@ async def sync_paid_access(bot, payment_id: str) -> tuple[dict | None, dict | No
     return payment, refreshed_access_record
 
 
-async def revoke_expired_access(bot, user_id: int, access_record: dict) -> None:
+async def grant_manual_access(
+    bot,
+    *,
+    user_id: int,
+    tariff_key: str,
+    duration: timedelta | None,
+    label: str,
+    granted_by: int,
+) -> dict:
+    now = utc_now()
+    existing_access = get_access_record(user_id)
+    base_time = get_access_base_time(existing_access, now)
+    expires_at = base_time + duration if duration is not None else None
+
+    access_record = upsert_access_record(
+        user_id,
+        active=True,
+        tariff_key=tariff_key,
+        grant_label=label,
+        grant_duration_seconds=int(duration.total_seconds()) if duration is not None else None,
+        source_payment_id=f"manual:{granted_by}:{int(now.timestamp())}",
+        activated_at=serialize_datetime(now),
+        expires_at=serialize_datetime(expires_at),
+        is_member=bool(existing_access.get("is_member")) if existing_access else False,
+        granted_manually=True,
+        granted_by=granted_by,
+        revoked_at=None,
+        removed_at=None,
+    )
+    access_record = await ensure_join_request_link(bot, user_id, access_record)
+    return access_record
+
+
+async def deactivate_user_access(
+    bot,
+    *,
+    user_id: int,
+    access_record: dict,
+    notify_text: str,
+    revoked_by: int | None = None,
+) -> None:
     now = utc_now()
 
     if PAID_CHAT_ID:
@@ -668,6 +1153,7 @@ async def revoke_expired_access(bot, user_id: int, access_record: dict) -> None:
         active=False,
         is_member=False,
         revoked_at=serialize_datetime(now),
+        revoked_by=revoked_by,
         invite_link=None,
         invite_link_expires_at=None,
     )
@@ -675,14 +1161,23 @@ async def revoke_expired_access(bot, user_id: int, access_record: dict) -> None:
     try:
         await bot.send_message(
             chat_id=user_id,
-            text=(
-                "Срок подписки закончился, доступ в приватку отключен.\n\n"
-                "Если хочешь вернуться, оформи новую подписку в боте."
-            ),
+            text=notify_text,
             reply_markup=main_menu_keyboard(),
         )
     except Exception:
-        logging.exception("Не удалось отправить уведомление об окончании подписки")
+        logging.exception("Не удалось отправить уведомление пользователю %s", user_id)
+
+
+async def revoke_expired_access(bot, user_id: int, access_record: dict) -> None:
+    await deactivate_user_access(
+        bot,
+        user_id=user_id,
+        access_record=access_record,
+        notify_text=(
+            "Срок подписки закончился, доступ в приватку отключен.\n\n"
+            "Если хочешь вернуться, оформи новую подписку в боте."
+        ),
+    )
 
 
 async def process_expired_accesses(bot) -> None:
@@ -816,6 +1311,7 @@ async def handle_tariff_selection(query, tariff_key: str) -> None:
     tariff = TARIFFS[tariff_key]
     user = query.from_user
     user_name = f"@{user.username}" if user.username else user.full_name
+    remember_user(user, last_action=f"buy:{tariff_key}")
 
     try:
         transaction = await create_transaction(tariff_key, user.id, user_name)
@@ -833,11 +1329,14 @@ async def handle_tariff_selection(query, tariff_key: str) -> None:
     upsert_payment(
         invoice_id,
         user_id=user.id,
+        username=user.username or "",
+        full_name=user.full_name,
         tariff_key=tariff_key,
         pay_url=pay_url,
         status=transaction.get("status", "PENDING"),
         expires_in=transaction.get("expiresIn"),
         delivered=False,
+        created_at=serialize_datetime(utc_now()),
     )
 
     await query.edit_message_text(
@@ -900,10 +1399,12 @@ async def handle_invoice_check(query) -> bool:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    remember_user(update.effective_user, last_action="start")
     await update.message.reply_text(WELCOME_TEXT, reply_markup=main_menu_keyboard())
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    remember_user(update.effective_user, last_action="status")
     access_record = get_access_record(update.effective_user.id)
     if access_record and has_active_access(access_record):
         access_record = await ensure_join_request_link(context.bot, update.effective_user.id, access_record)
@@ -915,11 +1416,220 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def admin_panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.type != "private" or not is_admin_user(update.effective_user.id):
+        return
+
+    remember_user(update.effective_user, last_action=f"admin_command:{ADMIN_PANEL_COMMAND}")
+    context.user_data.pop(ADMIN_STATE_KEY, None)
+    await delete_message_safely(update.message)
+    await upsert_admin_panel_message(
+        context,
+        chat_id=update.effective_chat.id,
+        text=build_admin_home_text(),
+        reply_markup=admin_home_keyboard(),
+    )
+
+
+async def process_admin_grant_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    raw_text: str,
+) -> tuple[bool, str]:
+    parts = raw_text.split()
+    if len(parts) != 2:
+        return False, "Нужен формат: user_id тариф"
+
+    target_user_id = resolve_user_reference(parts[0])
+    if target_user_id is None:
+        return False, "Не удалось определить пользователя. Используй user_id или @username из базы бота."
+
+    grant_spec = parse_admin_duration(parts[1])
+    if grant_spec is None:
+        return False, "Неизвестный срок. Используй tariff_week, forever или формат вроде 1m, 1h, 3d, 2w, 1mo."
+
+    access_record = await grant_manual_access(
+        context.bot,
+        user_id=target_user_id,
+        tariff_key=grant_spec["tariff_key"],
+        duration=grant_spec["duration"],
+        label=grant_spec["label"],
+        granted_by=update.effective_user.id,
+    )
+    user_record = get_user_record(target_user_id)
+    notification_sent = True
+
+    try:
+        await context.bot.send_message(
+            chat_id=target_user_id,
+            text=(
+                "Администратор выдал тебе доступ в приватку.\n\n"
+                f"{access_status_text(access_record)}"
+            ),
+            reply_markup=paid_keyboard(access_record),
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        notification_sent = False
+        logging.exception("Не удалось уведомить пользователя %s о ручной выдаче доступа", target_user_id)
+
+    notice = (
+        f"Доступ выдан: {build_user_display_name(target_user_id, user_record)}\n"
+        f"ID: {target_user_id}\n"
+        f"Выдано на: {grant_spec['label']}\n"
+        f"Новый статус: {access_status_brief(access_record)}"
+    )
+    if not notification_sent:
+        notice += "\nПользователю не удалось отправить уведомление в личку."
+    return True, notice
+
+
+async def process_admin_revoke_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    raw_text: str,
+) -> tuple[bool, str]:
+    parts = raw_text.split()
+    if len(parts) != 1:
+        return False, "Для снятия доступа отправь только user_id или @username."
+
+    target_user_id = resolve_user_reference(parts[0])
+    if target_user_id is None:
+        return False, "Не удалось определить пользователя. Используй user_id или @username из базы бота."
+
+    access_record = get_access_record(target_user_id)
+    if not access_record or (not has_active_access(access_record) and not access_record.get("is_member")):
+        return False, "У этого пользователя сейчас нет активного доступа."
+
+    await deactivate_user_access(
+        context.bot,
+        user_id=target_user_id,
+        access_record=access_record,
+        notify_text=(
+            "Доступ в приватку отключен администратором.\n\n"
+            "Если это выглядит как ошибка, напиши в поддержку."
+        ),
+        revoked_by=update.effective_user.id,
+    )
+
+    user_record = get_user_record(target_user_id)
+    return True, (
+        f"Доступ снят: {build_user_display_name(target_user_id, user_record)}\n"
+        f"ID: {target_user_id}"
+    )
+
+
+async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.type != "private" or not is_admin_user(update.effective_user.id):
+        return
+
+    admin_state = context.user_data.get(ADMIN_STATE_KEY)
+    if not admin_state:
+        return
+
+    remember_user(update.effective_user, last_action=f"admin_input:{admin_state.get('action', 'unknown')}")
+    raw_text = (update.message.text or "").strip()
+    await delete_message_safely(update.message)
+
+    if admin_state.get("action") == "grant":
+        success, notice = await process_admin_grant_message(update, context, raw_text)
+        help_text = build_admin_grant_help_text()
+    elif admin_state.get("action") == "revoke":
+        success, notice = await process_admin_revoke_message(update, context, raw_text)
+        help_text = build_admin_revoke_help_text()
+    else:
+        context.user_data.pop(ADMIN_STATE_KEY, None)
+        await upsert_admin_panel_message(
+            context,
+            chat_id=update.effective_chat.id,
+            text=build_admin_home_text(),
+            reply_markup=admin_home_keyboard(),
+        )
+        return
+
+    if success:
+        context.user_data.pop(ADMIN_STATE_KEY, None)
+        await upsert_admin_panel_message(
+            context,
+            chat_id=update.effective_chat.id,
+            text=f"{notice}\n\n{build_admin_home_text()}",
+            reply_markup=admin_home_keyboard(),
+        )
+        return
+
+    await upsert_admin_panel_message(
+        context,
+        chat_id=update.effective_chat.id,
+        text=f"{notice}\n\n{help_text}",
+        reply_markup=admin_input_keyboard(),
+    )
+
+
+async def handle_admin_callback(query, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if not is_admin_user(query.from_user.id):
+        await query.answer()
+        return True
+
+    remember_user(query.from_user, last_action=query.data)
+    remember_admin_panel_message(context, query.message.chat_id, query.message.message_id)
+
+    data = query.data
+    context.user_data.setdefault(ADMIN_PANEL_CHAT_ID_KEY, query.message.chat_id)
+    context.user_data.setdefault(ADMIN_PANEL_MESSAGE_ID_KEY, query.message.message_id)
+
+    if data == "admin:home":
+        context.user_data.pop(ADMIN_STATE_KEY, None)
+        await query.edit_message_text(
+            build_admin_home_text(),
+            reply_markup=admin_home_keyboard(),
+            disable_web_page_preview=True,
+        )
+    elif data == "admin:grant":
+        context.user_data[ADMIN_STATE_KEY] = {"action": "grant"}
+        await query.edit_message_text(
+            build_admin_grant_help_text(),
+            reply_markup=admin_input_keyboard(),
+            disable_web_page_preview=True,
+        )
+    elif data == "admin:revoke":
+        context.user_data[ADMIN_STATE_KEY] = {"action": "revoke"}
+        await query.edit_message_text(
+            build_admin_revoke_help_text(),
+            reply_markup=admin_input_keyboard(),
+            disable_web_page_preview=True,
+        )
+    elif data.startswith("admin:list:"):
+        context.user_data.pop(ADMIN_STATE_KEY, None)
+        _, _, mode, page_raw = data.split(":", maxsplit=3)
+        try:
+            page = int(page_raw)
+        except ValueError:
+            page = 0
+        list_text, list_keyboard = build_admin_user_list(mode, page)
+        await query.edit_message_text(
+            list_text,
+            reply_markup=list_keyboard,
+            disable_web_page_preview=True,
+        )
+    elif data == "admin:close":
+        context.user_data.pop(ADMIN_STATE_KEY, None)
+        await query.answer()
+        await delete_message_safely(query.message)
+        return True
+    else:
+        await query.answer("Неизвестное действие.", show_alert=True)
+        return True
+
+    await query.answer()
+    return True
+
+
 async def handle_chat_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     request = update.chat_join_request
     if not request or not PAID_CHAT_ID or request.chat.id != PAID_CHAT_ID:
         return
 
+    remember_user(request.from_user, last_action="chat_join_request")
     user_id = request.from_user.id
     access_record = get_access_record(user_id)
 
@@ -959,9 +1669,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     query = update.callback_query
     data = query.data
     already_answered = False
+    remember_user(query.from_user, last_action=data)
 
     try:
-        if data == "main_menu":
+        if data.startswith("admin:"):
+            already_answered = await handle_admin_callback(query, context)
+        elif data == "main_menu":
             await show_main_menu(query)
         elif data == "buy":
             await show_tariffs(query)
@@ -1000,6 +1713,8 @@ def build_application(*, manual_webhook: bool = False) -> Application:
     app = builder.build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler(ADMIN_PANEL_COMMAND, admin_panel_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_text_input))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(ChatJoinRequestHandler(handle_chat_join_request))
     return app
@@ -1182,6 +1897,9 @@ def main() -> None:
         return
 
     logging.basicConfig(level=logging.INFO)
+
+    if not ADMIN_USER_IDS:
+        logging.warning("ADMIN_USER_IDS не задан. Скрытая админ-панель будет недоступна.")
 
     if WEBHOOK_URL:
         asyncio.run(run_manual_webhook())
