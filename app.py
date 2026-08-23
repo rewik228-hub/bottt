@@ -385,9 +385,13 @@ def access_status_text(access_record: dict | None) -> str:
     if has_active_access(access_record, now=now):
         expires_at = get_access_expires_at(access_record)
         membership_text = "Ты уже в приватке." if access_record.get("is_member") else "Ожидается твоя заявка на вступление."
+        if expires_at is None:
+            expiry_text = "Доступ действует бессрочно."
+        else:
+            expiry_text = f"Доступ действует до: {format_datetime_local(expires_at)}"
         return (
             "Подписка активна.\n"
-            f"Доступ действует до: {format_datetime_local(expires_at)}\n"
+            f"{expiry_text}\n"
             f"{membership_text}"
         )
 
@@ -831,7 +835,10 @@ def paid_keyboard(access_record: dict | None = None) -> InlineKeyboardMarkup:
     if access_is_active and entry_link:
         keyboard.append([InlineKeyboardButton("Подать заявку в канал", url=entry_link)])
 
-    keyboard.append([InlineKeyboardButton("Мой доступ", callback_data="access_status")])
+    if access_is_active:
+        keyboard.append([InlineKeyboardButton("Мой доступ", callback_data="access_status")])
+    else:
+        keyboard.append([InlineKeyboardButton("Оплатить тариф", callback_data="buy")])
     keyboard.append([InlineKeyboardButton("◀ Главное меню", callback_data="main_menu")])
     return InlineKeyboardMarkup(keyboard)
 
