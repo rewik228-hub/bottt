@@ -15,6 +15,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -418,6 +419,17 @@ def build_user_display_name(user_id: int, user_record: dict | None = None) -> st
     return f"Пользователь {user_id}"
 
 
+def get_access_entry_link(access_record: dict | None = None) -> str:
+    if isinstance(PAID_CHANNEL_LINK, str) and PAID_CHANNEL_LINK.strip():
+        return PAID_CHANNEL_LINK.strip()
+
+    invite_link = access_record.get("invite_link") if access_record else None
+    if isinstance(invite_link, str):
+        return invite_link.strip()
+
+    return ""
+
+
 def access_status_brief(access_record: dict | None) -> str:
     if not access_record:
         return "нет доступа"
@@ -672,6 +684,16 @@ async def delete_message_safely(message) -> None:
         logging.exception("Не удалось удалить сообщение %s", getattr(message, "message_id", "?"))
 
 
+async def safe_edit_query_message(query, text: str, reply_markup=None, **kwargs) -> bool:
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, **kwargs)
+        return True
+    except BadRequest as exc:
+        if "message is not modified" in str(exc).lower():
+            return False
+        raise
+
+
 def normalize_admin_tariff_key(raw_value: str) -> str | None:
     normalized = raw_value.strip().lower()
     alias_map = {
@@ -805,12 +827,9 @@ def invoice_keyboard(pay_url: str, invoice_id: str) -> InlineKeyboardMarkup:
 def paid_keyboard(access_record: dict | None = None) -> InlineKeyboardMarkup:
     keyboard = []
     access_is_active = has_active_access(access_record)
-
-    invite_link = access_record.get("invite_link") if access_record else None
-    if access_is_active and invite_link:
-        keyboard.append([InlineKeyboardButton("Подать заявку в канал", url=invite_link)])
-    elif access_is_active and PAID_CHANNEL_LINK:
-        keyboard.append([InlineKeyboardButton("Открыть канал", url=PAID_CHANNEL_LINK)])
+    entry_link = get_access_entry_link(access_record)
+    if access_is_active and entry_link:
+        keyboard.append([InlineKeyboardButton("Подать заявку в канал", url=entry_link)])
 
     keyboard.append([InlineKeyboardButton("Мой доступ", callback_data="access_status")])
     keyboard.append([InlineKeyboardButton("◀ Главное меню", callback_data="main_menu")])
@@ -839,20 +858,17 @@ def build_invoice_text(tariff: dict, invoice_id: str) -> str:
 
 def build_paid_text(tariff: dict, access_record: dict | None = None) -> str:
     lines = [tariff["success_title"], "", access_status_text(access_record)]
-
-    invite_link = access_record.get("invite_link") if access_record else None
-    if invite_link:
+    entry_link = get_access_entry_link(access_record)
+    if entry_link:
         lines.extend(
             [
                 "",
                 "Нажми на кнопку ниже и отправь заявку на вступление. Бот примет ее автоматически.",
-                invite_link,
+                entry_link,
             ]
         )
     elif access_record and access_record.get("is_member"):
         lines.extend(["", "Ты уже находишься в приватке."])
-    elif PAID_CHANNEL_LINK:
-        lines.extend(["", "Если нужно открыть канал вручную, используй эту ссылку:", PAID_CHANNEL_LINK])
     else:
         lines.extend(
             [
@@ -1027,8 +1043,31 @@ async def create_join_request_link(bot, user_id: int, expires_at: datetime | Non
     }
 
 
+async def allow_user_to_rejoin_paid_chat(bot, user_id: int) -> None:
+    if not PAID_CHAT_ID:
+        return
+
+    try:
+        member = await bot.get_chat_member(PAID_CHAT_ID, user_id)
+    except Exception:
+        logging.exception("Не удалось проверить статус пользователя %s в приватке", user_id)
+        return
+
+    if member.status != "kicked":
+        return
+
+    try:
+        await bot.unban_chat_member(PAID_CHAT_ID, user_id, only_if_banned=True)
+    except Exception:
+        logging.exception("Не удалось снять бан с пользователя %s перед повторным входом", user_id)
+
+
 async def ensure_join_request_link(bot, user_id: int, access_record: dict) -> dict:
     if not PAID_CHAT_ID or access_record.get("is_member"):
+        return access_record
+
+    await allow_user_to_rejoin_paid_chat(bot, user_id)
+    if get_access_entry_link(access_record):
         return access_record
 
     expires_at = get_access_expires_at(access_record)
@@ -1091,7 +1130,7 @@ async def sync_paid_access(bot, payment_id: str) -> tuple[dict | None, dict | No
         )
 
     refreshed_access_record = await ensure_join_request_link(bot, user_id, access_record or {})
-    delivery_link = refreshed_access_record.get("invite_link") or PAID_CHANNEL_LINK or ""
+    delivery_link = get_access_entry_link(refreshed_access_record)
     payment = upsert_payment(payment_id, delivered=bool(delivery_link), delivery_link=delivery_link)
     return payment, refreshed_access_record
 
@@ -1142,11 +1181,22 @@ async def deactivate_user_access(
     if PAID_CHAT_ID:
         try:
             member = await bot.get_chat_member(PAID_CHAT_ID, user_id)
-            if member.status not in {"left", "kicked"}:
-                await bot.ban_chat_member(PAID_CHAT_ID, user_id)
-                await bot.unban_chat_member(PAID_CHAT_ID, user_id, only_if_banned=True)
         except Exception:
-            logging.exception("Не удалось исключить пользователя %s из приватки", user_id)
+            logging.exception("Не удалось проверить статус пользователя %s перед исключением", user_id)
+        else:
+            if member.status not in {"left", "kicked"}:
+                try:
+                    await bot.ban_chat_member(PAID_CHAT_ID, user_id)
+                except Exception:
+                    logging.exception("Не удалось исключить пользователя %s из приватки", user_id)
+                else:
+                    try:
+                        await bot.unban_chat_member(PAID_CHAT_ID, user_id, only_if_banned=True)
+                    except Exception:
+                        logging.exception(
+                            "Пользователь %s исключен, но снять бан не удалось. Повторно сниму бан при новой выдаче доступа.",
+                            user_id,
+                        )
 
     upsert_access_record(
         user_id,
@@ -1276,19 +1326,20 @@ async def get_transaction(transaction_id: str) -> dict | None:
 
 
 async def show_main_menu(query) -> None:
-    await query.edit_message_text(WELCOME_TEXT, reply_markup=main_menu_keyboard())
+    await safe_edit_query_message(query, WELCOME_TEXT, reply_markup=main_menu_keyboard())
 
 
 async def show_tariffs(query) -> None:
-    await query.edit_message_text(TARIFFS_TEXT, reply_markup=tariff_menu_keyboard())
+    await safe_edit_query_message(query, TARIFFS_TEXT, reply_markup=tariff_menu_keyboard())
 
 
 async def show_support(query) -> None:
-    await query.edit_message_text(SUPPORT_TEXT, reply_markup=back_to_main_menu_keyboard())
+    await safe_edit_query_message(query, SUPPORT_TEXT, reply_markup=back_to_main_menu_keyboard())
 
 
 async def show_documents(query) -> None:
-    await query.edit_message_text(
+    await safe_edit_query_message(
+        query,
         DOCUMENTS_TEXT,
         reply_markup=back_to_main_menu_keyboard(),
         disable_web_page_preview=True,
@@ -1300,7 +1351,8 @@ async def show_access_status(query) -> None:
     if access_record and has_active_access(access_record):
         access_record = await ensure_join_request_link(query.bot, query.from_user.id, access_record)
 
-    await query.edit_message_text(
+    await safe_edit_query_message(
+        query,
         access_status_text(access_record),
         reply_markup=paid_keyboard(access_record),
         disable_web_page_preview=True,
@@ -1317,7 +1369,8 @@ async def handle_tariff_selection(query, tariff_key: str) -> None:
         transaction = await create_transaction(tariff_key, user.id, user_name)
     except Exception:
         logging.exception("Не удалось создать транзакцию Platega")
-        await query.edit_message_text(
+        await safe_edit_query_message(
+            query,
             "Не удалось создать счет. Попробуй еще раз чуть позже или напиши в поддержку.",
             reply_markup=back_to_main_menu_keyboard(),
         )
@@ -1339,7 +1392,8 @@ async def handle_tariff_selection(query, tariff_key: str) -> None:
         created_at=serialize_datetime(utc_now()),
     )
 
-    await query.edit_message_text(
+    await safe_edit_query_message(
+        query,
         build_invoice_text(tariff, invoice_id),
         reply_markup=invoice_keyboard(pay_url, invoice_id),
         disable_web_page_preview=True,
@@ -1376,7 +1430,8 @@ async def handle_invoice_check(query) -> bool:
 
     if status == "CONFIRMED":
         _, access_record = await sync_paid_access(query.bot, invoice_id)
-        await query.edit_message_text(
+        await safe_edit_query_message(
+            query,
             build_paid_text(tariff, access_record),
             reply_markup=paid_keyboard(access_record),
             disable_web_page_preview=True,
@@ -1384,13 +1439,15 @@ async def handle_invoice_check(query) -> bool:
         return False
 
     if status in {"CANCELED", "CHARGEBACKED"}:
-        await query.edit_message_text(
+        await safe_edit_query_message(
+            query,
             build_expired_text(tariff),
             reply_markup=expired_invoice_keyboard(payment["tariff_key"]),
         )
         return False
 
-    await query.edit_message_text(
+    await safe_edit_query_message(
+        query,
         build_invoice_text(tariff, invoice_id),
         reply_markup=invoice_keyboard(payment["pay_url"], invoice_id),
         disable_web_page_preview=True,
@@ -1579,21 +1636,24 @@ async def handle_admin_callback(query, context: ContextTypes.DEFAULT_TYPE) -> bo
 
     if data == "admin:home":
         context.user_data.pop(ADMIN_STATE_KEY, None)
-        await query.edit_message_text(
+        await safe_edit_query_message(
+            query,
             build_admin_home_text(),
             reply_markup=admin_home_keyboard(),
             disable_web_page_preview=True,
         )
     elif data == "admin:grant":
         context.user_data[ADMIN_STATE_KEY] = {"action": "grant"}
-        await query.edit_message_text(
+        await safe_edit_query_message(
+            query,
             build_admin_grant_help_text(),
             reply_markup=admin_input_keyboard(),
             disable_web_page_preview=True,
         )
     elif data == "admin:revoke":
         context.user_data[ADMIN_STATE_KEY] = {"action": "revoke"}
-        await query.edit_message_text(
+        await safe_edit_query_message(
+            query,
             build_admin_revoke_help_text(),
             reply_markup=admin_input_keyboard(),
             disable_web_page_preview=True,
@@ -1606,7 +1666,8 @@ async def handle_admin_callback(query, context: ContextTypes.DEFAULT_TYPE) -> bo
         except ValueError:
             page = 0
         list_text, list_keyboard = build_admin_user_list(mode, page)
-        await query.edit_message_text(
+        await safe_edit_query_message(
+            query,
             list_text,
             reply_markup=list_keyboard,
             disable_web_page_preview=True,
