@@ -57,7 +57,7 @@ SELF_PING_ENABLED = os.getenv("SELF_PING_ENABLED", "true").lower() in {
 }
 SELF_PING_INTERVAL_SECONDS = int(os.getenv("SELF_PING_INTERVAL_SECONDS", "840"))
 ACCESS_CHECK_INTERVAL_SECONDS = int(os.getenv("ACCESS_CHECK_INTERVAL_SECONDS", "300"))
-SUPPORT_USERNAME = "@volot543"
+SUPPORT_USERNAME = "@volot5433"
 PAYMENTS_FILE = Path("payments.json")
 BASE_DIR = Path(__file__).resolve().parent
 PRIVACY_POLICY_FILE = BASE_DIR / "legal" / "privacy_policy.txt"
@@ -960,7 +960,6 @@ def resolve_user_reference(raw_value: str) -> int | None:
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     keyboard = [
         [InlineKeyboardButton("Купить доступ", callback_data="buy")],
-        [InlineKeyboardButton("Мой доступ", callback_data="access_status")],
         [InlineKeyboardButton("Документы", callback_data="documents")],
         [InlineKeyboardButton("Поддержка", callback_data="support")],
     ]
@@ -1000,9 +999,7 @@ def paid_keyboard(access_record: dict | None = None) -> InlineKeyboardMarkup:
     if access_is_active and entry_link:
         keyboard.append([InlineKeyboardButton("Подать заявку в канал", url=entry_link)])
 
-    if access_is_active:
-        keyboard.append([InlineKeyboardButton("Мой доступ", callback_data="access_status")])
-    else:
+    if not access_is_active:
         keyboard.append([InlineKeyboardButton("Оплатить тариф", callback_data="buy")])
     keyboard.append([InlineKeyboardButton("◀ Главное меню", callback_data="main_menu")])
     return InlineKeyboardMarkup(keyboard)
