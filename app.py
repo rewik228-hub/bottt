@@ -186,6 +186,8 @@ TARIFFS_TEXT = (
     "Навсегда - 2700 RUB"
 )
 
+PLATEGA_SUCCESS_STATUSES = {"CONFIRMED", "SUBSCRIPTION_ACTIVATED"}
+
 
 def utc_now() -> datetime:
     return datetime.now(UTC)
@@ -510,6 +512,7 @@ def admin_home_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("Снять доступ", callback_data="admin:revoke"),
             ],
             [
+                InlineKeyboardButton("Восстановить", callback_data="admin:restore"),
                 InlineKeyboardButton("Рассылка", callback_data="admin:broadcast"),
             ],
             [
@@ -652,6 +655,21 @@ def build_admin_broadcast_help_text() -> str:
     )
 
 
+def build_admin_restore_help_text() -> str:
+    return (
+        "Восстановление подписки\n\n"
+        "Отправь одной строкой:\n"
+        "`user_id tariff_key payment_id [subscription_id] [purchase_at_or_expires_at]`\n\n"
+        "Если после `payment_id` сразу идет дата, бот считает ее моментом покупки и сам прибавляет длительность тарифа.\n"
+        "Можно вставить и JSON с полями `user_id`, `tariff_key`, `payment_id`, `subscription_id`, `purchased_at`, `expires_at`.\n\n"
+        "Примеры:\n"
+        "`672352889 tariff_day 90333fa2-390c-48cd-8dc9-f769d5372dd0`\n"
+        "`672352889 tariff_day 90333fa2-390c-48cd-8dc9-f769d5372dd0 24.08.2026-02:10:21`\n"
+        "`672352889 tariff_day 90333fa2-390c-48cd-8dc9-f769d5372dd0 sub-123 25.08.2026-02:10:21`\n\n"
+        "Если `subscription_id` не указан, бот подставит `payment_id`."
+    )
+
+
 def remember_admin_panel_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int) -> None:
     context.user_data[ADMIN_PANEL_CHAT_ID_KEY] = chat_id
     context.user_data[ADMIN_PANEL_MESSAGE_ID_KEY] = message_id
@@ -779,6 +797,142 @@ def parse_admin_duration(raw_value: str) -> dict | None:
         "label": label,
         "is_forever": False,
     }
+
+
+def parse_admin_restore_datetime(raw_value: str | None) -> datetime | None:
+    if raw_value is None:
+        return None
+
+    normalized = raw_value.strip()
+    if not normalized or normalized.lower() == "forever":
+        return None
+
+    parsed = parse_datetime(normalized)
+    if parsed is not None:
+        return parsed
+
+    match = re.fullmatch(
+        r"(?P<day>\d{2})\.(?P<month>\d{2})\.(?P<year>\d{4})[- ](?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})",
+        normalized,
+    )
+    if not match:
+        return None
+
+    try:
+        return datetime(
+            int(match.group("year")),
+            int(match.group("month")),
+            int(match.group("day")),
+            int(match.group("hour")),
+            int(match.group("minute")),
+            int(match.group("second")),
+            tzinfo=MOSCOW_TZ,
+        ).astimezone(UTC)
+    except ValueError:
+        return None
+
+
+def parse_admin_restore_entry(raw_text: str) -> tuple[dict | None, str | None]:
+    text = raw_text.strip()
+    if not text:
+        return None, "Пустая строка."
+
+    source: dict[str, object]
+    if text.startswith("{") and text.endswith("}"):
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return None, "Не удалось разобрать JSON."
+        if not isinstance(parsed, dict):
+            return None, "JSON должен быть объектом."
+        source = parsed
+    else:
+        parts = text.split()
+        if len(parts) < 3:
+            return None, "Нужен формат: user_id tariff_key payment_id [subscription_id] [expires_at]"
+
+        source = {
+            "user_id": parts[0],
+            "tariff_key": parts[1],
+            "payment_id": parts[2],
+        }
+        if len(parts) == 4 and parse_admin_restore_datetime(parts[3]) is not None:
+            source["subscription_id"] = parts[2]
+            source["purchased_at"] = parts[3]
+        elif len(parts) >= 4:
+            source["subscription_id"] = parts[3]
+            if len(parts) >= 5:
+                source["expires_at"] = " ".join(parts[4:])
+
+    payload_source = source.get("payload")
+    payload_data: dict[str, object] = {}
+    if isinstance(payload_source, str):
+        try:
+            parsed_payload = json.loads(payload_source)
+        except json.JSONDecodeError:
+            parsed_payload = None
+        if isinstance(parsed_payload, dict):
+            payload_data = parsed_payload
+    elif isinstance(payload_source, dict):
+        payload_data = payload_source
+
+    metadata_source = source.get("metadata")
+    metadata_data = metadata_source if isinstance(metadata_source, dict) else {}
+
+    user_ref = (
+        source.get("user_id")
+        or source.get("userId")
+        or payload_data.get("user_id")
+        or payload_data.get("userId")
+        or metadata_data.get("userId")
+    )
+    tariff_value = (
+        source.get("tariff_key")
+        or source.get("tariffKey")
+        or payload_data.get("tariff_key")
+        or payload_data.get("tariffKey")
+    )
+    payment_id = (
+        source.get("payment_id")
+        or source.get("paymentId")
+        or source.get("transaction_id")
+        or source.get("transactionId")
+        or source.get("id")
+    )
+    subscription_id = source.get("subscription_id") or source.get("subscriptionId") or payment_id
+    expires_raw = (
+        source.get("expires_at")
+        or source.get("expiresAt")
+        or source.get("next_charge_at")
+        or source.get("nextChargeAt")
+    )
+    purchased_raw = source.get("purchased_at") or source.get("purchasedAt")
+
+    user_id = resolve_user_reference(str(user_ref or ""))
+    tariff_key = normalize_admin_tariff_key(str(tariff_value or ""))
+    payment_id_str = str(payment_id or "").strip()
+    subscription_id_str = str(subscription_id or "").strip() or payment_id_str
+    expires_at = parse_admin_restore_datetime(str(expires_raw)) if expires_raw is not None else None
+    purchased_at = parse_admin_restore_datetime(str(purchased_raw)) if purchased_raw is not None else None
+
+    if user_id is None:
+        return None, "Не удалось определить `user_id`."
+    if not tariff_key:
+        return None, "Не удалось определить `tariff_key`."
+    if not payment_id_str:
+        return None, "Не удалось определить `payment_id`."
+
+    return (
+        {
+            "user_id": user_id,
+            "tariff_key": tariff_key,
+            "payment_id": payment_id_str,
+            "subscription_id": subscription_id_str,
+            "purchased_at": purchased_at,
+            "expires_at": expires_at,
+        },
+        None,
+    )
 
 
 def resolve_user_reference(raw_value: str) -> int | None:
@@ -1456,7 +1610,7 @@ async def handle_invoice_check(query) -> bool:
 
     upsert_payment(invoice_id, status=status)
 
-    if status == "CONFIRMED":
+    if status in PLATEGA_SUCCESS_STATUSES:
         _, access_record = await sync_paid_access(query.bot, invoice_id)
         await safe_edit_query_message(
             query,
@@ -1602,6 +1756,88 @@ async def process_admin_revoke_message(
     )
 
 
+async def process_admin_restore_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    raw_text: str,
+) -> tuple[bool, str]:
+    restored_entry, error_text = parse_admin_restore_entry(raw_text)
+    if restored_entry is None:
+        return False, error_text or "Не удалось разобрать данные для восстановления."
+
+    user_id = int(restored_entry["user_id"])
+    tariff_key = str(restored_entry["tariff_key"])
+    payment_id = str(restored_entry["payment_id"])
+    subscription_id = str(restored_entry["subscription_id"])
+    purchased_at = restored_entry["purchased_at"]
+    expires_at = restored_entry["expires_at"]
+
+    tariff = TARIFFS[tariff_key]
+    existing_access = get_access_record(user_id)
+    now = utc_now()
+
+    if not isinstance(expires_at, datetime):
+        if tariff.get("recurring"):
+            if isinstance(purchased_at, datetime):
+                expires_at = purchased_at + timedelta(days=int(tariff["interval_days"]))
+            else:
+                base_time = get_access_base_time(existing_access, now)
+                expires_at = base_time + timedelta(days=int(tariff["interval_days"]))
+        else:
+            expires_at = None
+
+    status = "SUBSCRIPTION_ACTIVATED" if tariff.get("recurring") else "CONFIRMED"
+    created_at = purchased_at if isinstance(purchased_at, datetime) else now
+    payment = upsert_payment(
+        payment_id,
+        user_id=user_id,
+        tariff_key=tariff_key,
+        status=status,
+        subscription_id=subscription_id,
+        created_at=serialize_datetime(created_at),
+        access_applied=True,
+        access_expires_at=serialize_datetime(expires_at),
+        restored_by=update.effective_user.id,
+        restored_at=serialize_datetime(now),
+    )
+
+    if subscription_id and subscription_id != payment_id:
+        mirror_payment_alias(payment_id, subscription_id, payment)
+
+    access_record = upsert_access_record(
+        user_id,
+        active=True,
+        tariff_key=tariff_key,
+        source_payment_id=payment_id,
+        activated_at=serialize_datetime(created_at),
+        expires_at=serialize_datetime(expires_at),
+        is_member=bool(existing_access.get("is_member")) if existing_access else False,
+        removed_at=None,
+        revoked_at=None,
+    )
+    access_record = await ensure_join_request_link(context.bot, user_id, access_record)
+    delivery_link = get_access_entry_link(access_record)
+    payment = upsert_payment(
+        payment_id,
+        delivered=bool(delivery_link),
+        delivery_link=delivery_link,
+        subscription_id=subscription_id,
+    )
+    if subscription_id and subscription_id != payment_id:
+        mirror_payment_alias(payment_id, subscription_id, payment)
+
+    user_record = get_user_record(user_id)
+    expiry_text = format_datetime_local(expires_at) if isinstance(expires_at, datetime) else "навсегда"
+    return True, (
+        f"Подписка восстановлена: {build_user_display_name(user_id, user_record)}\n"
+        f"ID: {user_id}\n"
+        f"Тариф: {tariff['label']}\n"
+        f"Payment ID: {payment_id}\n"
+        f"Subscription ID: {subscription_id}\n"
+        f"Доступ активен до: {expiry_text}"
+    )
+
+
 async def process_admin_broadcast_message(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1662,6 +1898,9 @@ async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif admin_state.get("action") == "revoke":
         success, notice = await process_admin_revoke_message(update, context, raw_text)
         help_text = build_admin_revoke_help_text()
+    elif admin_state.get("action") == "restore":
+        success, notice = await process_admin_restore_message(update, context, raw_text)
+        help_text = build_admin_restore_help_text()
     elif admin_state.get("action") == "broadcast":
         success, notice = await process_admin_broadcast_message(update, context, raw_text)
         help_text = build_admin_broadcast_help_text()
@@ -1726,6 +1965,14 @@ async def handle_admin_callback(query, context: ContextTypes.DEFAULT_TYPE) -> bo
         await safe_edit_query_message(
             query,
             build_admin_revoke_help_text(),
+            reply_markup=admin_input_keyboard(),
+            disable_web_page_preview=True,
+        )
+    elif data == "admin:restore":
+        context.user_data[ADMIN_STATE_KEY] = {"action": "restore"}
+        await safe_edit_query_message(
+            query,
+            build_admin_restore_help_text(),
             reply_markup=admin_input_keyboard(),
             disable_web_page_preview=True,
         )
@@ -1941,7 +2188,7 @@ async def run_manual_webhook() -> None:
         if subscription_id and payment_id and subscription_id != payment_id:
             mirror_payment_alias(payment_id, subscription_id, payment)
 
-        if status in {"CONFIRMED", "SUBSCRIPTION_ACTIVATED"}:
+        if status in PLATEGA_SUCCESS_STATUSES:
             tariff = TARIFFS.get(payment.get("tariff_key", ""))
             chat_id = payment.get("user_id")
 
